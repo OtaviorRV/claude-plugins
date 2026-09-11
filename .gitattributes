@@ -1,0 +1,4 @@
+* text=auto
+
+# Scripts de shell precisam de LF: com CRLF o bash falha com `$'\r': command not found`.
+*.sh text eol=lf
