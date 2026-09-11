@@ -1,0 +1,22 @@
+{
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node",
+            "args": ["${CLAUDE_PLUGIN_ROOT}/scripts/prompt-refiner.js", "block", "${CLAUDE_PLUGIN_DATA}"]
+          },
+          {
+            "type": "command",
+            "command": "node",
+            "args": ["${CLAUDE_PLUGIN_ROOT}/scripts/prompt-refiner.js", "rewake", "${CLAUDE_PLUGIN_DATA}"],
+            "asyncRewake": true,
+            "timeout": 300
+          }
+        ]
+      }
+    ]
+  }
+}

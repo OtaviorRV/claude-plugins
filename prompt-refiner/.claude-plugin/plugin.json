@@ -1,0 +1,8 @@
+{
+  "name": "prompt-refiner",
+  "version": "0.1.0",
+  "description": "Reescreve cada mensagem enviada em Markdown organizado e a entrega ao Claude no lugar da original, para respostas mais assertivas",
+  "author": {
+    "name": "oreis"
+  }
+}

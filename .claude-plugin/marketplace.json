@@ -1,0 +1,14 @@
+{
+  "name": "oreis-plugins",
+  "owner": {
+    "name": "oreis"
+  },
+  "description": "Plugins locais do oreis para o Claude Code",
+  "plugins": [
+    {
+      "name": "prompt-refiner",
+      "source": "./prompt-refiner",
+      "description": "Reescreve cada mensagem enviada em Markdown organizado e a entrega ao Claude no lugar da original, para respostas mais assertivas"
+    }
+  ]
+}
