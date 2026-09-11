@@ -105,4 +105,4 @@ O `log.jsonl` guarda o texto das suas mensagens em disco. Apague o arquivo, ou o
 
 ## Licença
 
-Sem licença declarada por enquanto.
+MIT — veja [LICENSE](LICENSE).

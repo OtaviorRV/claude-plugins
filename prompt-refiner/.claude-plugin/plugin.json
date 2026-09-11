@@ -4,5 +4,7 @@
   "description": "Reescreve cada mensagem enviada em Markdown organizado e a entrega ao Claude no lugar da original, para respostas mais assertivas",
   "author": {
     "name": "oreis"
-  }
+  },
+  "license": "MIT",
+  "repository": "https://github.com/OtaviorRV/claude-plugins"
 }
