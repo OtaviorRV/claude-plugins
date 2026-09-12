@@ -47,6 +47,10 @@ case "$STATUS" in
   fallback)
     printf '[REFINER fallback]'
     ;;
+  skipped)
+    # Reescrita passou do limite de injecao: a mensagem seguiu sozinha.
+    printf '[REFINER intacta]'
+    ;;
 esac
 
 exit 0

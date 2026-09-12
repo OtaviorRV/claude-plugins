@@ -1,10 +1,20 @@
 'use strict';
 // UserPromptSubmit hook do plugin prompt-refiner.
-//   block  : hook síncrono. Bloqueia a mensagem original (decision "block" a remove do contexto).
-//   rewake : hook asyncRewake. Reescreve a mensagem e a entrega ao Claude pelo stderr com exit 2.
-// A entrega do rewake volta a passar por UserPromptSubmit; MARKER e o registro de entregas
-// fazem os dois modos deixá-la seguir sem reescrever de novo.
-// argv[3] é ${CLAUDE_PLUGIN_DATA}: estado da statusline, cache, fila de ordem e log.
+//
+// Um hook síncrono, sem bloqueio: reescreve a mensagem do usuário e devolve o
+// texto em `additionalContext`. Esse canal não produz entrada visível para o
+// usuário (hooks.md, "UserPromptSubmit decision control"), então a sessão fica
+// sem linha de aviso, sem notificação e sem turno extra.
+//
+// A versão 0.1.0 bloqueava a mensagem original com `decision: "block"` e
+// entregava o texto reescrito por um hook `asyncRewake`. Isso substituía a
+// mensagem de fato, mas bloquear é visível por construção: cada mensagem
+// mostrava `UserPromptSubmit operation blocked by hook:` e uma notificação
+// `Stop hook feedback`. Trocado por decisão do usuário: silêncio vale mais que
+// substituição. Consequência declarada: o modelo vê as duas versões, a digitada
+// e a reescrita.
+//
+// argv[2] é ${CLAUDE_PLUGIN_DATA}: estado da statusline, cache e log.
 const { spawn } = require('child_process');
 const crypto = require('crypto');
 const fs = require('fs');
@@ -12,33 +22,19 @@ const os = require('os');
 const path = require('path');
 
 const MARKER = '<!-- prompt-refiner:encaminhado -->';
-const HEADER = 'Mensagem enviada pelo usuário, reescrita pelo plugin prompt-refiner. A mensagem original foi substituída por este texto:';
-const ESCAPE_PREFIX = '='; // mensagem começando com "=" segue literal, sem reescrita
+const HEADER = 'Versão reescrita desta mensagem do usuário, produzida pelo plugin prompt-refiner a partir do texto que ele enviou neste turno: mesmo conteúdo, redação corrigida, referências resolvidas. É a formulação que vale para a tarefa; o texto digitado permanece como original.';
+const ESCAPE_PREFIX = '='; // mensagem começando com "=" não é reescrita
 const MODEL = 'sonnet';
 const EFFORT = 'medium';
-const CHILD_DEADLINE_MS = 240000; // abaixo do timeout de 300 s do hook em hooks.json
-const ORDER_WAIT_MS = 60000; // espera máxima pela entrega de uma mensagem anterior
-const ORDER_STALE_MS = 300000; // ticket mais velho que isso é abandonado
+const CHILD_DEADLINE_MS = 90000; // abaixo do timeout de 120 s do hook em hooks.json
+const MAX_CONTEXT_CHARS = 9500; // acima de 10.000 o Claude Code troca o texto por prévia + caminho de arquivo
 const CACHE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const STATE_TTL_MS = 24 * 60 * 60 * 1000;
 const LOG_MAX_BYTES = 5 * 1024 * 1024;
 const CONTEXT_MAX_CHARS = 2000;
 const TRANSCRIPT_TAIL_BYTES = 262144;
-const DELIVERED_KEEP = 5;
-const DELIVERED_HEAD_CHARS = 200;
 const SYSTEM_PROMPT_FILE = path.join(__dirname, '..', 'prompts', 'reformulacao.md');
 
-const mode = process.argv[2];
-const rawDataDir = process.argv[3] || '';
-// Placeholder não substituído (plugin carregado de um jeito que não expande
-// ${CLAUDE_PLUGIN_DATA}) não pode virar nome de diretório. Cai no caminho que a
-// documentação declara para esse diretório, `~/.claude/plugins/data/{id}/`, para
-// estado, cache, fila e log não sumirem em silêncio.
-function fallbackDataDir() {
-  const base = process.env.CLAUDE_CONFIG_DIR || path.join(os.homedir(), '.claude');
-  return path.join(base, 'plugins', 'data', 'prompt-refiner');
-}
-const dataDir = (!rawDataDir || rawDataDir.includes('$')) ? fallbackDataDir() : rawDataDir;
 const startedAt = Date.now();
 let prompt = '';
 let sessionId = '';
@@ -49,17 +45,26 @@ try {
   if (typeof input.session_id === 'string') sessionId = input.session_id;
   if (typeof input.transcript_path === 'string') transcriptPath = input.transcript_path;
 } catch (e) {
-  prompt = ''; // entrada ilegível: passa direto, a mensagem original segue sem bloqueio
+  prompt = ''; // entrada ilegível: nada a reescrever, a mensagem segue como veio
 }
+
+// Placeholder não substituído não pode virar nome de diretório. Cai no caminho
+// que a documentação declara para esse diretório, `~/.claude/plugins/data/{id}/`.
+function fallbackDataDir() {
+  const base = process.env.CLAUDE_CONFIG_DIR || path.join(os.homedir(), '.claude');
+  return path.join(base, 'plugins', 'data', 'prompt-refiner');
+}
+const rawDataDir = process.argv[2] || '';
+const dataDir = (!rawDataDir || rawDataDir.includes('$')) ? fallbackDataDir() : rawDataDir;
 
 const slug = sessionId.replace(/[^A-Za-z0-9_-]/g, '-');
 const sha256 = (text) => crypto.createHash('sha256').update(text).digest('hex');
-// Nada de estado, cache, fila ou log pode interromper o fluxo da mensagem.
+// Nada de estado, cache ou log pode atrapalhar a mensagem.
 const quiet = (fn, fallback) => { try { return fn(); } catch (e) { return fallback; } };
 const dataPath = (...parts) => path.join(dataDir, ...parts);
 
 function writeState(status, extra) {
-  if (!dataDir || !slug) return;
+  if (!slug) return;
   quiet(() => {
     fs.mkdirSync(dataDir, { recursive: true });
     fs.writeFileSync(dataPath(`state-${slug}.json`), JSON.stringify(Object.assign({ status, ts: Date.now() }, extra)));
@@ -67,7 +72,6 @@ function writeState(status, extra) {
 }
 
 function prune() {
-  if (!dataDir) return;
   quiet(() => {
     for (const name of fs.readdirSync(dataDir)) {
       if (!name.startsWith('state-')) continue;
@@ -81,77 +85,11 @@ function prune() {
       if (Date.now() - fs.statSync(file).mtimeMs > CACHE_TTL_MS) fs.unlinkSync(file);
     }
   });
-  quiet(() => {
-    for (const name of fs.readdirSync(dataPath('pending', slug))) {
-      const file = dataPath('pending', slug, name);
-      if (Date.now() - fs.statSync(file).mtimeMs > ORDER_STALE_MS) fs.unlinkSync(file);
-    }
-  });
 }
 
-// --- registro de entregas: segundo guarda do passthrough ---------------------
-// O MARKER é o guarda primário. Se um dia o envelope do Claude Code deixar de
-// repassar o comentário HTML, o trecho inicial do texto já entregue ainda
-// identifica a reentrada e evita reescrever (e pagar) a mesma mensagem em laço.
-function deliveredEntries() {
-  return quiet(() => {
-    const raw = JSON.parse(fs.readFileSync(dataPath(`delivered-${slug}.json`), 'utf8'));
-    return Array.isArray(raw) ? raw : [];
-  }, []);
-}
-
-function recordDelivered(body) {
-  if (!dataDir || !slug) return;
-  quiet(() => {
-    fs.mkdirSync(dataDir, { recursive: true });
-    const entries = deliveredEntries();
-    entries.push({ head: body.slice(0, DELIVERED_HEAD_CHARS), ts: Date.now() });
-    fs.writeFileSync(dataPath(`delivered-${slug}.json`), JSON.stringify(entries.slice(-DELIVERED_KEEP)));
-  });
-}
-
-function wasDelivered(text) {
-  if (!dataDir || !slug) return false;
-  return deliveredEntries().some((e) => e && typeof e.head === 'string' && e.head.length >= 40 && text.includes(e.head));
-}
-
-// --- ordem de entrega -------------------------------------------------------
-// Duas mensagens enviadas dentro da janela de reescrita terminam em ordem
-// imprevisível. O ticket é tirado na entrada do hook (ordem de envio) e a
-// entrega espera os tickets mais antigos saírem.
-function claimTicket() {
-  if (!dataDir || !slug) return null;
-  return quiet(() => {
-    const dir = dataPath('pending', slug);
-    fs.mkdirSync(dir, { recursive: true });
-    const ticket = { ts: startedAt, file: path.join(dir, `${startedAt}-${sha256(prompt).slice(0, 8)}.tkt`) };
-    fs.writeFileSync(ticket.file, '');
-    return ticket;
-  }, null);
-}
-
-function waitTurn(ticket, done) {
-  if (!ticket) return done();
-  const deadline = Date.now() + ORDER_WAIT_MS;
-  const tick = () => {
-    const blocked = quiet(() => fs.readdirSync(path.dirname(ticket.file)).some((name) => {
-      if (!name.endsWith('.tkt') || name === path.basename(ticket.file)) return false;
-      const ts = Number(name.split('-')[0]);
-      return Number.isFinite(ts) && ts < ticket.ts && Date.now() - ts < ORDER_STALE_MS;
-    }), false);
-    if (!blocked || Date.now() > deadline) return done();
-    setTimeout(tick, 200);
-  };
-  tick();
-}
-
-const releaseTicket = (ticket) => { if (ticket) quiet(() => fs.unlinkSync(ticket.file)); };
-
-// --- cache ------------------------------------------------------------------
 const cacheFile = (key) => dataPath('cache', `${key}.txt`);
 
 function cacheGet(key) {
-  if (!dataDir) return null;
   return quiet(() => {
     const file = cacheFile(key);
     if (Date.now() - fs.statSync(file).mtimeMs > CACHE_TTL_MS) return null;
@@ -161,16 +99,13 @@ function cacheGet(key) {
 }
 
 function cacheSet(key, text) {
-  if (!dataDir) return;
   quiet(() => {
     fs.mkdirSync(dataPath('cache'), { recursive: true });
     fs.writeFileSync(cacheFile(key), text);
   });
 }
 
-// --- log de auditoria -------------------------------------------------------
 function appendLog(entry) {
-  if (!dataDir) return;
   quiet(() => {
     fs.mkdirSync(dataDir, { recursive: true });
     const file = dataPath('log.jsonl');
@@ -179,7 +114,6 @@ function appendLog(entry) {
   });
 }
 
-// --- contexto da conversa ---------------------------------------------------
 // Mensagem de sessão real é elíptica ("pode", "faz isso", "e o outro arquivo?").
 // Sem o turno anterior, a reescrita só conserta ortografia. O texto abaixo serve
 // exclusivamente para resolver referência; as regras de uso estão no system prompt.
@@ -205,16 +139,9 @@ function lastAssistantText() {
   }, '');
 }
 
-// --- fluxo ------------------------------------------------------------------
 function passThrough(text) {
   const t = text.trimStart();
-  if (t === '' || t.startsWith('/') || t.startsWith('!') || t.startsWith(ESCAPE_PREFIX)) return true;
-  return text.includes(MARKER) || wasDelivered(text);
-}
-
-function deliver(text) {
-  process.stderr.write(`${MARKER}\n${HEADER}\n\n${text}`);
-  process.exitCode = 2;
+  return t === '' || t.startsWith('/') || t.startsWith('!') || t.startsWith(ESCAPE_PREFIX) || text.includes(MARKER);
 }
 
 function rewrite(text, context, done) {
@@ -243,35 +170,38 @@ function rewrite(text, context, done) {
 
 if (passThrough(prompt)) {
   process.exit(0);
-} else if (mode === 'block') {
+}
+
+prune();
+writeState('rewriting');
+const context = lastAssistantText();
+const key = sha256(`${MODEL}|${EFFORT}|${context}|${prompt}`);
+
+// Falha, prazo estourado ou texto acima do limite de injeção não injetam nada:
+// a mensagem original segue sozinha, que é o comportamento de antes do plugin.
+function settle(result, status) {
+  const ms = Date.now() - startedAt;
+  const tooLong = result !== null && result.length > MAX_CONTEXT_CHARS;
+  const finalStatus = tooLong ? 'skipped' : status;
+  if (result !== null && status === 'ok' && !tooLong) cacheSet(key, result);
+  writeState(finalStatus, { ms });
+  appendLog({
+    ts: new Date().toISOString(), session: sessionId, status: finalStatus, ms,
+    context_chars: context.length, original: prompt, refined: result === null ? '' : result,
+  });
+  if (result === null || tooLong) process.exit(0);
   process.stdout.write(JSON.stringify({
-    decision: 'block',
-    reason: 'refinando a mensagem',
-    hookSpecificOutput: { hookEventName: 'UserPromptSubmit', suppressOriginalPrompt: true },
+    hookSpecificOutput: {
+      hookEventName: 'UserPromptSubmit',
+      additionalContext: `${MARKER}\n${HEADER}\n\n${result}`,
+    },
   }));
-} else if (mode === 'rewake') {
-  prune();
-  writeState('rewriting');
-  const ticket = claimTicket();
-  const context = lastAssistantText();
-  const key = sha256(`${MODEL}|${EFFORT}|${context}|${prompt}`);
+}
 
-  // Qualquer falha entrega a mensagem original sem alteração, para ela não se perder.
-  const settle = (result, status) => {
-    const body = result === null ? prompt : result;
-    const ms = Date.now() - startedAt;
-    if (result !== null && status === 'ok') cacheSet(key, result);
-    writeState(status, { ms });
-    recordDelivered(body);
-    appendLog({ ts: new Date().toISOString(), session: sessionId, status, ms, context_chars: context.length, original: prompt, refined: body });
-    waitTurn(ticket, () => { releaseTicket(ticket); deliver(body); });
-  };
-
-  try {
-    const cached = cacheGet(key);
-    if (cached) settle(cached, 'cache');
-    else rewrite(prompt, context, (result) => settle(result, result === null ? 'fallback' : 'ok'));
-  } catch (e) {
-    settle(null, 'fallback');
-  }
+try {
+  const cached = cacheGet(key);
+  if (cached) settle(cached, 'cache');
+  else rewrite(prompt, context, (result) => settle(result, result === null ? 'fallback' : 'ok'));
+} catch (e) {
+  settle(null, 'fallback');
 }
