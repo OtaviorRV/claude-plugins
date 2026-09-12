@@ -25,6 +25,29 @@ Substituição e silêncio não coexistem no caminho de hooks. A v0.2.0 escolheu
 
 </details>
 
+### Garantia da substituição: modo proxy (opcional)
+
+No modo padrão o modelo vê as duas versões e escolhe. Para a substituição ser estrutural — o modelo nunca receber o texto original — a troca tem que acontecer depois da interface, no corpo da requisição. O repo traz `proxy/prompt-refiner-proxy.js` para isso.
+
+Como funciona: com `PROMPT_REFINER_MODE=proxy`, o hook não injeta nada; ele grava a reescrita em `swap/<sha256 do texto original>.txt`. O proxy local, apontado por `ANTHROPIC_BASE_URL`, troca todo bloco de texto de mensagem `user` que tenha reescrita gravada, inclusive nos turnos antigos do histórico, e repassa o resto byte a byte. A troca é determinística, então o histórico reenviado não oscila entre original e reescrito.
+
+A assinatura claude.ai continua valendo: apontar só `ANTHROPIC_BASE_URL`, **sem** variável de credencial de gateway, mantém o login claude.ai como credencial ativa ([docs](https://code.claude.com/docs/en/llm-gateway#subscriptions-and-gateways)). O proxy repassa os cabeçalhos sem alteração, `anthropic-beta` incluído, que é onde vai a capability de OAuth.
+
+```
+# terminal 1, deixe rodando
+node proxy/prompt-refiner-proxy.js
+
+# settings.json do usuário
+"env": {
+  "ANTHROPIC_BASE_URL": "http://127.0.0.1:8787",
+  "PROMPT_REFINER_MODE": "proxy"
+}
+```
+
+Antes de ligar isso, entenda o preço: **todo** o tráfego de modelo de **todas** as suas sessões passa a depender desse processo. Com o proxy fora do ar, nenhuma sessão alcança a API. Ele falha para o lado seguro em tudo o mais — erro de parse, corpo comprimido, reescrita ausente, e a requisição segue exatamente como veio — mas não sobrevive a não estar rodando.
+
+Modo `context` (padrão) não precisa de nada disso.
+
 ### Requisitos
 
 - Claude Code v2.1.269 ou mais recente (testado nessa versão, em Windows 11)

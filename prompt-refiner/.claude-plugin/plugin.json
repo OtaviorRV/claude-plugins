@@ -1,6 +1,6 @@
 {
   "name": "prompt-refiner",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "description": "Reescreve cada mensagem enviada em Markdown organizado e entrega a versão reescrita ao Claude junto da mensagem, sem ruído na sessão, para respostas mais assertivas",
   "author": {
     "name": "oreis"

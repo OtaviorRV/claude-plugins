@@ -26,6 +26,11 @@ const HEADER = 'Versão reescrita desta mensagem do usuário, produzida pelo plu
 const ESCAPE_PREFIX = '='; // mensagem começando com "=" não é reescrita
 const MODEL = 'sonnet';
 const EFFORT = 'medium';
+// "context" (padrão): entrega a reescrita em additionalContext, sem bloquear e
+// sem ruído, e o modelo vê as duas versões. "proxy": grava a reescrita em
+// swap/<sha256 do original>.txt e não injeta nada — quem troca a mensagem é o
+// proxy em ANTHROPIC_BASE_URL, e aí o modelo só vê a versão reescrita.
+const MODE = process.env.PROMPT_REFINER_MODE === 'proxy' ? 'proxy' : 'context';
 const CHILD_DEADLINE_MS = 90000; // abaixo do timeout de 120 s do hook em hooks.json
 const MAX_CONTEXT_CHARS = 9500; // acima de 10.000 o Claude Code troca o texto por prévia + caminho de arquivo
 const CACHE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
@@ -191,17 +196,29 @@ const key = sha256(`${MODEL}|${EFFORT}|${context}|${prompt}`);
 
 // Falha, prazo estourado ou texto acima do limite de injeção não injetam nada:
 // a mensagem original segue sozinha, que é o comportamento de antes do plugin.
+// O proxy encontra a reescrita por hash do texto original, sem precisar saber
+// nada do contexto nem do modelo usados para produzi-la.
+function writeSwap(original, refined) {
+  quiet(() => {
+    fs.mkdirSync(dataPath('swap'), { recursive: true });
+    fs.writeFileSync(dataPath('swap', `${sha256(original.trim())}.txt`), refined);
+  });
+}
+
 function settle(result, status) {
   const ms = Date.now() - startedAt;
-  const tooLong = result !== null && result.length > MAX_CONTEXT_CHARS;
+  // O limite só existe no canal de contexto: acima de 10.000 caracteres o Claude
+  // Code troca additionalContext por prévia mais caminho de arquivo.
+  const tooLong = MODE === 'context' && result !== null && result.length > MAX_CONTEXT_CHARS;
   const finalStatus = tooLong ? 'skipped' : status;
   if (result !== null && status === 'ok' && !tooLong) cacheSet(key, result);
-  writeState(finalStatus, { ms });
+  if (result !== null && !tooLong && MODE === 'proxy') writeSwap(prompt, result);
+  writeState(finalStatus, { ms, mode: MODE });
   appendLog({
-    ts: new Date().toISOString(), session: sessionId, status: finalStatus, ms,
+    ts: new Date().toISOString(), session: sessionId, mode: MODE, status: finalStatus, ms,
     context_chars: context.length, original: prompt, refined: result === null ? '' : result,
   });
-  if (result === null || tooLong) process.exit(0);
+  if (result === null || tooLong || MODE === 'proxy') process.exit(0);
   process.stdout.write(JSON.stringify({
     hookSpecificOutput: {
       hookEventName: 'UserPromptSubmit',
