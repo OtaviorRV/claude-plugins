@@ -85,6 +85,13 @@ function prune() {
       if (Date.now() - fs.statSync(file).mtimeMs > CACHE_TTL_MS) fs.unlinkSync(file);
     }
   });
+  // Restos da 0.1.0, que precisava deles para ordenar entregas e barrar reentrada.
+  quiet(() => {
+    for (const name of fs.readdirSync(dataDir)) {
+      if (name.startsWith('delivered-')) fs.unlinkSync(dataPath(name));
+    }
+  });
+  quiet(() => fs.rmSync(dataPath('pending'), { recursive: true, force: true }));
 }
 
 const cacheFile = (key) => dataPath('cache', `${key}.txt`);
@@ -141,7 +148,12 @@ function lastAssistantText() {
 
 function passThrough(text) {
   const t = text.trimStart();
-  return t === '' || t.startsWith('/') || t.startsWith('!') || t.startsWith(ESCAPE_PREFIX) || text.includes(MARKER);
+  if (t === '' || t.startsWith('/') || t.startsWith('!') || t.startsWith(ESCAPE_PREFIX)) return true;
+  // Texto do próprio harness também chega por este evento: notificação de tarefa
+  // em background, lembrete de sistema, retorno de hook. Reescrever isso gasta
+  // uma chamada de modelo por notificação e não melhora pedido nenhum.
+  if (t.startsWith('<task-notification>') || t.startsWith('<system-reminder>')) return true;
+  return text.includes(MARKER);
 }
 
 function rewrite(text, context, done) {
